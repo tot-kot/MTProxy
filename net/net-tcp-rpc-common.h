@@ -137,6 +137,10 @@ struct tcp_rpc_data {
   int extra_int2;
   int extra_int3;
   int extra_int4;
+  /* Which configured secret this client authenticated with, biased by one so
+     that a zero-initialised structure means "not known yet" rather than
+     "secret number zero". Used to meter connections per secret. */
+  int ext_secret_slot;
   double extra_double, extra_double2;
   crc32_partial_func_t custom_crc_partial;
 };

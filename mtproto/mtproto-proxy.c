@@ -26,6 +26,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1115,6 +1116,10 @@ int mtproto_proxy_rpc_close (connection_job_t C, int who) {
   int fd = CONN_INFO(C)->fd;
   assert ((unsigned) fd < MAX_CONNECTIONS);
   vkprintf (3, "proxy_rpc connection closing (%d) by %d\n", fd, who);
+  if (D->ext_secret_slot) {
+    tcp_rpcs_release_ext_secret (D->ext_secret_slot - 1);
+    D->ext_secret_slot = 0;
+  }
   if (D->extra_int) {
     assert (D->extra_int == -get_conn_tag (C));
     struct ext_connection *H = &ExtConnectionHead[fd], *Ex, *Ex_next;
@@ -2133,6 +2138,29 @@ void usage (void) {
 }
 
 server_functions_t mtproto_front_functions;
+/* 32 hex digits into 16 bytes. Shared by -S, -P and --secret-limit so that
+   all three agree on what a secret looks like. */
+static int parse_hex_secret (const char *text, unsigned char secret[16]) {
+  int i;
+  unsigned char b = 0;
+  for (i = 0; i < 32; i++) {
+    if (text[i] >= '0' && text[i] <= '9') {
+      b = b * 16 + text[i] - '0';
+    } else if (text[i] >= 'a' && text[i] <= 'f') {
+      b = b * 16 + text[i] - 'a' + 10;
+    } else if (text[i] >= 'A' && text[i] <= 'F') {
+      b = b * 16 + text[i] - 'A' + 10;
+    } else {
+      return -1;
+    }
+    if (i & 1) {
+      secret[i / 2] = b;
+      b = 0;
+    }
+  }
+  return 0;
+}
+
 int f_parse_option (int val) {
   char *colon, *ptr;
   switch (val) {
@@ -2192,6 +2220,33 @@ int f_parse_option (int val) {
     tcp_rpc_add_proxy_domain (optarg);
     domain_count++;
     break;
+  case 2001:
+    {
+      /* A customer's tariff is a property of their secret, not of the process
+         that happens to serve them, so that several customers on different
+         tariffs can share one proxy. */
+      char *sep = strchr (optarg, ':');
+      if (!sep || sep - optarg != 32) {
+        kprintf ("'secret-limit' option requires <32 hex digits>:<max-connections>\n");
+        usage ();
+      }
+      unsigned char secret[16];
+      if (parse_hex_secret (optarg, secret) < 0) {
+        kprintf ("'secret-limit' option requires 32 hex digits before the colon\n");
+        usage ();
+      }
+      char *end = NULL;
+      long max_conn = strtol (sep + 1, &end, 10);
+      if (!end || *end || max_conn < 0 || max_conn > INT_MAX) {
+        kprintf ("'secret-limit' option requires a non-negative connection count\n");
+        usage ();
+      }
+      if (tcp_rpcs_set_ext_secret_max_conn (secret, (int) max_conn) < 0) {
+        kprintf ("'secret-limit' names a secret that was not given with -S\n");
+        usage ();
+      }
+    }
+    break;
   case 'S':
   case 'P':
     {
@@ -2201,23 +2256,9 @@ int f_parse_option (int val) {
       }
 
       unsigned char secret[16];
-      int i;
-      unsigned char b = 0;
-      for (i = 0; i < 32; i++) {
-        if (optarg[i] >= '0' && optarg[i] <= '9')  {
-          b = b * 16 + optarg[i] - '0';
-        } else if (optarg[i] >= 'a' && optarg[i] <= 'f') {
-          b = b * 16 + optarg[i] - 'a' + 10;
-        } else if (optarg[i] >= 'A' && optarg[i] <= 'F') {
-          b = b * 16 + optarg[i] - 'A' + 10;
-        } else {
-          kprintf ("'S' option requires exactly 32 hex digits. '%c' is not hexdigit\n", optarg[i]);
-          usage ();
-        }
-        if (i & 1) {
-          secret[i / 2] = b;
-          b = 0;
-        }
+      if (parse_hex_secret (optarg, secret) < 0) {
+        kprintf ("'%c' option requires exactly 32 hex digits\n", val);
+        usage ();
       }
       if (val == 'S') {
 	tcp_rpcs_set_ext_secret (secret);
@@ -2240,6 +2281,7 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");
   parse_option ("max-special-connections", required_argument, 0, 'C', "sets maximal number of accepted client connections per worker");
+  parse_option ("secret-limit", required_argument, 0, 2001, "<secret-hex>:<max-connections> limits one secret's concurrent client connections; repeatable, and the secret must already be given with -S");
   parse_option ("window-clamp", required_argument, 0, 'W', "sets window clamp for client TCP connections");
   parse_option ("http-ports", required_argument, 0, 'H', "comma-separated list of client (HTTP) ports to listen");
   // parse_option ("outbound-connections-ps", required_argument, 0, 'o', "limits creation rate of outbound connections to mtproto-servers (default %d)", DEFAULT_OUTBOUND_CONNECTION_CREATION_RATE);

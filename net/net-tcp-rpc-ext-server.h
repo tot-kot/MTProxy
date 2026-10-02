@@ -31,6 +31,14 @@ int tcp_rpcs_compact_parse_execute (connection_job_t c);
 
 void tcp_rpcs_set_ext_secret(unsigned char secret[16]);
 
+/* Returns the index of the secret the limit was applied to, or -1 when no
+   configured secret matches. */
+int tcp_rpcs_set_ext_secret_max_conn(unsigned char secret[16], int max_conn);
+/* 1 when the connection may proceed, 0 when the secret is at its limit. */
+int tcp_rpcs_acquire_ext_secret(int secret_id);
+void tcp_rpcs_release_ext_secret(int secret_id);
+int tcp_rpcs_ext_secret_conn_count(int secret_id);
+
 void tcp_rpc_add_proxy_domain (const char *domain);
 
 void tcp_rpc_init_proxy_domains();

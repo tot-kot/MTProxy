@@ -150,9 +150,64 @@ int tcp_rpcs_default_execute (connection_job_t c, int op, struct raw_message *ms
 static unsigned char ext_secret[16][16];
 static int ext_secret_cnt = 0;
 
+/* Per-secret limits and live connection counts.
+   A container serves one customer per secret, and customers buy different
+   tariffs, so the connection limit belongs to the secret rather than to the
+   process: without this, the only way to give two customers different limits
+   is to give them separate containers, which is what makes a single client
+   cost a whole proxy process.
+
+   Counts are per process. With -M the proxy forks workers that share nothing,
+   so a limit of N with M workers admits up to N*M connections - the same
+   caveat the built-in -C option carries, which is documented as being per
+   worker. The deployment runs a single worker. */
+static int ext_secret_max_conn[16];
+static int ext_secret_conn_count[16];
+
 void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
   assert (ext_secret_cnt < 16);
   memcpy (ext_secret[ext_secret_cnt ++], secret, 16);
+}
+
+int tcp_rpcs_set_ext_secret_max_conn (unsigned char secret[16], int max_conn) {
+  int i;
+  for (i = 0; i < ext_secret_cnt; i++) {
+    if (!memcmp (ext_secret[i], secret, 16)) {
+      ext_secret_max_conn[i] = max_conn;
+      return i;
+    }
+  }
+  return -1;
+}
+
+/* Optimistic: claim the slot, then give it back if the claim overshot. Doing
+   it the other way round would let two threads both observe room and both
+   take it. */
+int tcp_rpcs_acquire_ext_secret (int secret_id) {
+  if (secret_id < 0 || secret_id >= ext_secret_cnt) {
+    return 1;
+  }
+  int taken = __sync_add_and_fetch (&ext_secret_conn_count[secret_id], 1);
+  int limit = ext_secret_max_conn[secret_id];
+  if (limit > 0 && taken > limit) {
+    __sync_fetch_and_add (&ext_secret_conn_count[secret_id], -1);
+    return 0;
+  }
+  return 1;
+}
+
+void tcp_rpcs_release_ext_secret (int secret_id) {
+  if (secret_id < 0 || secret_id >= 16) {
+    return;
+  }
+  __sync_fetch_and_add (&ext_secret_conn_count[secret_id], -1);
+}
+
+int tcp_rpcs_ext_secret_conn_count (int secret_id) {
+  if (secret_id < 0 || secret_id >= 16) {
+    return 0;
+  }
+  return ext_secret_conn_count[secret_id];
 }
 
 static int allow_only_tls;
@@ -1166,6 +1221,16 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           RETURN_TLS_ERROR(info);
         }
 
+        /* Claimed before the server hello is built rather than after: that
+           response allocates and encrypts, and there is no reason to spend it
+           on a connection that is about to be refused. Refusal looks like any
+           other failed handshake. */
+        if (!tcp_rpcs_acquire_ext_secret (secret_id)) {
+          vkprintf (1, "connection limit reached for secret %d\n", secret_id);
+          RETURN_TLS_ERROR(info);
+        }
+        D->ext_secret_slot = secret_id + 1;
+
         int pos = 76;
         int cipher_suites_length = read_length (client_hello, &pos);
         if (pos + cipher_suites_length > read_len) {
@@ -1335,6 +1400,13 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           int target = *(short *)(random_header + 60);
           D->extra_int4 = target;
           vkprintf (1, "tcp opportunistic encryption mode detected, tag = %08x, target=%d\n", tag, target);
+          if (!tcp_rpcs_acquire_ext_secret (secret_id)) {
+            /* Over this secret's connection limit. Answered exactly like a
+               wrong secret, so a client cannot tell the two apart by probing. */
+            vkprintf (1, "connection limit reached for secret %d\n", secret_id);
+            return (-1 << 28);
+          }
+          D->ext_secret_slot = secret_id + 1;
           ok = 1;
           break;
         } else {
