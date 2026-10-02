@@ -175,6 +175,118 @@ void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
   ext_secret_cnt ++;
 }
 
+/* Devices, counted the way the tariff is sold.
+
+   A device is an authorisation, which MTProto identifies by auth_key_id. One
+   device holds a separate key per data centre, so counting distinct key ids
+   outright would charge a single phone two to four times over. They are
+   therefore counted per data centre and the limit applied within each: a
+   device contributes exactly one key to each DC it talks to, so "at most N
+   distinct keys in every DC" is the same statement as "at most N devices".
+
+   Entries are sticky. A slot belongs to its device until the device has been
+   silent for the whole TTL, so a client that reconnects - or roams, or
+   switches network - keeps its place instead of racing a stranger for it. */
+/* A device opens several connections at once. Connections are not sold,
+   so this only has to be generous enough never to trip a real client. */
+#define CONNECTIONS_PER_DEVICE 16
+#define DEVICE_SLOTS_PER_SECRET 128
+#define DEVICE_TTL 28800.0
+
+struct device_slot {
+  long long auth_key_id;
+  int dc;
+  double last_seen;
+};
+
+static struct device_slot ext_secret_devices[16][DEVICE_SLOTS_PER_SECRET];
+static int ext_secret_max_devices[16];
+static int ext_secret_device_lock[16];
+
+static void lock_device_table (int secret_id) {
+  while (!__sync_bool_compare_and_swap (&ext_secret_device_lock[secret_id], 0, 1)) {
+    /* Held only for a table scan, and contended only by first packets of new
+       connections, so spinning beats sleeping here. */
+  }
+}
+
+static void unlock_device_table (int secret_id) {
+  __sync_synchronize ();
+  ext_secret_device_lock[secret_id] = 0;
+}
+
+void tcp_rpcs_set_ext_secret_max_devices (int secret_id, int max_devices) {
+  if (secret_id >= 0 && secret_id < 16) {
+    ext_secret_max_devices[secret_id] = max_devices;
+  }
+}
+
+/* Returns the slot index the device occupies, or -1 when the secret is already
+   serving as many devices in this data centre as it was sold. */
+int tcp_rpcs_claim_device (int secret_id, int dc, long long auth_key_id, double now) {
+  if (secret_id < 0 || secret_id >= ext_secret_cnt || !auth_key_id) {
+    return -1;
+  }
+  int limit = ext_secret_max_devices[secret_id];
+  struct device_slot *table = ext_secret_devices[secret_id];
+
+  lock_device_table (secret_id);
+
+  int free_slot = -1;
+  int seen_in_dc = 0;
+  int i;
+  for (i = 0; i < DEVICE_SLOTS_PER_SECRET; i++) {
+    struct device_slot *d = &table[i];
+    if (d->auth_key_id && now - d->last_seen > DEVICE_TTL) {
+      d->auth_key_id = 0;
+    }
+    if (!d->auth_key_id) {
+      if (free_slot < 0) {
+        free_slot = i;
+      }
+      continue;
+    }
+    if (d->auth_key_id == auth_key_id && d->dc == dc) {
+      d->last_seen = now;
+      unlock_device_table (secret_id);
+      return i;
+    }
+    if (d->dc == dc) {
+      seen_in_dc++;
+    }
+  }
+
+  if (limit > 0 && seen_in_dc >= limit) {
+    unlock_device_table (secret_id);
+    return -1;
+  }
+  if (free_slot < 0) {
+    unlock_device_table (secret_id);
+    return -1;
+  }
+
+  table[free_slot].auth_key_id = auth_key_id;
+  table[free_slot].dc = dc;
+  table[free_slot].last_seen = now;
+  unlock_device_table (secret_id);
+  return free_slot;
+}
+
+/* O(1) refresh for every packet after the first. The identity check catches a
+   slot that expired and was handed to another device while this connection was
+   idle; the caller then falls back to a full claim. */
+int tcp_rpcs_touch_device (int secret_id, int slot, long long auth_key_id, double now) {
+  if (secret_id < 0 || secret_id >= 16 || slot < 0 || slot >= DEVICE_SLOTS_PER_SECRET) {
+    return 0;
+  }
+  struct device_slot *d = &ext_secret_devices[secret_id][slot];
+  if (d->auth_key_id != auth_key_id) {
+    return 0;
+  }
+  d->last_seen = now;
+  return 1;
+}
+
 int tcp_rpcs_parse_hex_secret (const char *text, unsigned char secret[16]) {
   int i;
   unsigned char b = 0;
@@ -243,6 +355,13 @@ void tcp_rpcs_release_ext_secret (int secret_id) {
    read - in which case the running table is left exactly as it was. A proxy
    serving traffic on the old secrets is a far better outcome than one that
    dropped them because a file was briefly unreadable. */
+/* The file sells devices; connections follow from them and are only a guard
+   against one client monopolising the container's buffer pool. */
+static void apply_secret_limits (int slot, int devices) {
+  ext_secret_max_devices[slot] = devices;
+  ext_secret_max_conn[slot] = devices > 0 ? devices * CONNECTIONS_PER_DEVICE : 0;
+}
+
 int tcp_rpcs_load_ext_secret_file (const char *path) {
   FILE *f = fopen (path, "r");
   if (!f) {
@@ -250,7 +369,7 @@ int tcp_rpcs_load_ext_secret_file (const char *path) {
   }
 
   unsigned char parsed[16][16];
-  int parsed_max[16];
+  int parsed_devices[16];
   int parsed_cnt = 0;
   char line[256];
 
@@ -277,7 +396,7 @@ int tcp_rpcs_load_ext_secret_file (const char *path) {
         max_conn = 0;
       }
     }
-    parsed_max[parsed_cnt] = (int) max_conn;
+    parsed_devices[parsed_cnt] = (int) max_conn;
     parsed_cnt++;
   }
   fclose (f);
@@ -300,7 +419,7 @@ int tcp_rpcs_load_ext_secret_file (const char *path) {
   for (j = 0; j < parsed_cnt; j++) {
     for (i = 0; i < ext_secret_cnt; i++) {
       if (!keep[i] && !memcmp (ext_secret[i], parsed[j], 16)) {
-        ext_secret_max_conn[i] = parsed_max[j];
+        apply_secret_limits (i, parsed_devices[j]);
         ext_secret_active[i] = 1;
         keep[i] = 1;
         matched[j] = 1;
@@ -332,8 +451,9 @@ int tcp_rpcs_load_ext_secret_file (const char *path) {
     ext_secret_active[slot] = 0;
     __sync_synchronize ();
     memcpy (ext_secret[slot], parsed[j], 16);
-    ext_secret_max_conn[slot] = parsed_max[j];
+    apply_secret_limits (slot, parsed_devices[j]);
     ext_secret_conn_count[slot] = 0;
+    memset (ext_secret_devices[slot], 0, sizeof (ext_secret_devices[slot]));
     __sync_synchronize ();
     ext_secret_active[slot] = 1;
     keep[slot] = 1;

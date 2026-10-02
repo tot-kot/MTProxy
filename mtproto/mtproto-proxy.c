@@ -1682,6 +1682,26 @@ static int forward_mtproto_enc_packet (struct tl_in_state *tlio_in, connection_j
   }
   vkprintf (2, "received mtproto encrypted packet of %d bytes from connection %p (#%d~%d), key=%016llx\n", len, C, CONN_INFO(C)->fd, CONN_INFO(C)->generation, auth_key_id);
 
+  /* The tariff is sold in devices, and this is the first point where the
+     device is known: auth_key_id identifies the authorisation, which is what a
+     device is. The scan happens once per connection; afterwards the slot index
+     is cached on the connection and only a timestamp is refreshed. */
+  struct tcp_rpc_data *D = TCP_RPC_DATA(C);
+  if (D->ext_secret_slot) {
+    int secret_id = D->ext_secret_slot - 1;
+    int cached = D->ext_device_slot - 1;
+    if (D->ext_auth_key_id != auth_key_id || cached < 0 ||
+        !tcp_rpcs_touch_device (secret_id, cached, auth_key_id, precise_now)) {
+      int slot = tcp_rpcs_claim_device (secret_id, TCP_RPC_DATA(C)->extra_int4, auth_key_id, precise_now);
+      if (slot < 0) {
+        vkprintf (1, "device limit reached for secret %d, key=%016llx\n", secret_id, auth_key_id);
+        return 0;
+      }
+      D->ext_device_slot = slot + 1;
+      D->ext_auth_key_id = auth_key_id;
+    }
+  }
+
   CONN_INFO(C)->query_start_time = get_utime_monotonic ();
 
   conn_target_job_t S = choose_proxy_target (TCP_RPC_DATA(C)->extra_int4);

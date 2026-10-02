@@ -44,6 +44,14 @@ int tcp_rpcs_parse_hex_secret(const char *text, unsigned char secret[16]);
    secrets, or -1 when the file is unusable, leaving the table untouched. */
 int tcp_rpcs_load_ext_secret_file(const char *path);
 
+/* Device accounting. A device is an authorisation, identified by auth_key_id;
+   they are counted per data centre because one device holds one key in each. */
+void tcp_rpcs_set_ext_secret_max_devices(int secret_id, int max_devices);
+/* Slot index for this device, or -1 when the secret is at its device limit. */
+int tcp_rpcs_claim_device(int secret_id, int dc, long long auth_key_id, double now);
+/* 1 when the slot still belongs to this device and was refreshed. */
+int tcp_rpcs_touch_device(int secret_id, int slot, long long auth_key_id, double now);
+
 void tcp_rpc_add_proxy_domain (const char *domain);
 
 void tcp_rpc_init_proxy_domains();

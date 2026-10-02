@@ -141,6 +141,12 @@ struct tcp_rpc_data {
      that a zero-initialised structure means "not known yet" rather than
      "secret number zero". Used to meter connections per secret. */
   int ext_secret_slot;
+  /* Where this connection's device sits in that secret's device table, also
+     biased by one. Looking the device up costs a scan, so it is done once on
+     the first encrypted packet and the answer kept here; every later packet
+     only refreshes a timestamp by index. */
+  int ext_device_slot;
+  long long ext_auth_key_id;
   double extra_double, extra_double2;
   crc32_partial_func_t custom_crc_partial;
 };
