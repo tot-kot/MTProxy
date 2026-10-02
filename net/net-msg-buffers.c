@@ -265,6 +265,23 @@ struct msg_buffers_chunk *alloc_new_msg_buffers_chunk (struct msg_buffers_chunk 
   return C;
 };
 
+/* How full the message buffer pool is, as a percentage.
+
+   Chunks are never given back - the only function that freed one was dead
+   code and upstream has removed it - so this is a high-water mark, not a
+   momentary reading. When it reaches the ceiling alloc_msg_buffer returns
+   NULL and rwm_process_encrypt_decrypt aborts the process, which is what used
+   to kill this proxy about once a day. Callers use this to turn away new work
+   before that point rather than to recover afterwards: the allocation failure
+   happens deep inside the crypto path, several layers below anything that
+   knows what a connection is. */
+int msg_buffers_full_percent (void) {
+  if (max_buffer_chunks <= 0) {
+    return 0;
+  }
+  return (int) ((long long) allocated_buffer_chunks * 100 / max_buffer_chunks);
+}
+
 int init_msg_buffers (long max_buffer_bytes) {
   if (!max_buffer_bytes) {
     max_buffer_bytes = max_allocated_buffer_bytes ?: MSG_DEFAULT_MAX_ALLOCATED_BYTES;

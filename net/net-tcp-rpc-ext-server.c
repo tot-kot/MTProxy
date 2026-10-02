@@ -189,6 +189,12 @@ void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
    switches network - keeps its place instead of racing a stranger for it. */
 /* A device opens several connections at once. Connections are not sold,
    so this only has to be generous enough never to trip a real client. */
+/* Above this, new clients are turned away. The pool is never handed back, so
+   once it reaches the ceiling alloc_msg_buffer returns NULL and the process
+   aborts from inside the crypto path - several layers below anything holding
+   a connection, which is why this prevents rather than recovers. */
+#define BUFFER_PRESSURE_WATERMARK 85
+
 #define CONNECTIONS_PER_DEVICE 16
 #define DEVICE_SLOTS_PER_SECRET 128
 #define DEVICE_TTL 28800.0
@@ -1492,6 +1498,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           RETURN_TLS_ERROR(info);
         }
 
+        if (msg_buffers_full_percent () >= BUFFER_PRESSURE_WATERMARK) {
+          vkprintf (1, "buffer pool at %d%%, refusing new client\n", msg_buffers_full_percent ());
+          RETURN_TLS_ERROR(info);
+        }
+
         /* Claimed before the server hello is built rather than after: that
            response allocates and encrypts, and there is no reason to spend it
            on a connection that is about to be refused. Refusal looks like any
@@ -1674,6 +1685,10 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           int target = *(short *)(random_header + 60);
           D->extra_int4 = target;
           vkprintf (1, "tcp opportunistic encryption mode detected, tag = %08x, target=%d\n", tag, target);
+          if (msg_buffers_full_percent () >= BUFFER_PRESSURE_WATERMARK) {
+            vkprintf (1, "buffer pool at %d%%, refusing new client\n", msg_buffers_full_percent ());
+            return (-1 << 28);
+          }
           if (!tcp_rpcs_acquire_ext_secret (secret_id)) {
             /* Over this secret's connection limit. Answered exactly like a
                wrong secret, so a client cannot tell the two apart by probing. */

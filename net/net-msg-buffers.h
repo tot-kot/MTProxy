@@ -118,3 +118,7 @@ double msg_buffer_usage (void);
 
 extern long long max_allocated_buffer_bytes; 
 extern int allocated_buffer_chunks, max_allocated_buffer_chunks;
+
+/* Pool occupancy as a percentage; a high-water mark, since chunks are never
+   released. Reaching 100 aborts the process from inside the crypto path. */
+int msg_buffers_full_percent (void);
