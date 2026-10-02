@@ -38,6 +38,11 @@ int tcp_rpcs_set_ext_secret_max_conn(unsigned char secret[16], int max_conn);
 int tcp_rpcs_acquire_ext_secret(int secret_id);
 void tcp_rpcs_release_ext_secret(int secret_id);
 int tcp_rpcs_ext_secret_conn_count(int secret_id);
+/* 32 hex digits into 16 bytes; -1 on anything else. */
+int tcp_rpcs_parse_hex_secret(const char *text, unsigned char secret[16]);
+/* Replaces the live secret table from a file. Returns the number of active
+   secrets, or -1 when the file is unusable, leaving the table untouched. */
+int tcp_rpcs_load_ext_secret_file(const char *path);
 
 void tcp_rpc_add_proxy_domain (const char *domain);
 

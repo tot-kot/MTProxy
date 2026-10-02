@@ -163,10 +163,37 @@ static int ext_secret_cnt = 0;
    worker. The deployment runs a single worker. */
 static int ext_secret_max_conn[16];
 static int ext_secret_conn_count[16];
+/* A retired secret keeps its slot until its connections drain: clearing this
+   stops new handshakes from matching it without disturbing anyone already
+   connected through it. */
+static int ext_secret_active[16];
 
 void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
   assert (ext_secret_cnt < 16);
-  memcpy (ext_secret[ext_secret_cnt ++], secret, 16);
+  memcpy (ext_secret[ext_secret_cnt], secret, 16);
+  ext_secret_active[ext_secret_cnt] = 1;
+  ext_secret_cnt ++;
+}
+
+int tcp_rpcs_parse_hex_secret (const char *text, unsigned char secret[16]) {
+  int i;
+  unsigned char b = 0;
+  for (i = 0; i < 32; i++) {
+    if (text[i] >= '0' && text[i] <= '9') {
+      b = b * 16 + text[i] - '0';
+    } else if (text[i] >= 'a' && text[i] <= 'f') {
+      b = b * 16 + text[i] - 'a' + 10;
+    } else if (text[i] >= 'A' && text[i] <= 'F') {
+      b = b * 16 + text[i] - 'A' + 10;
+    } else {
+      return -1;
+    }
+    if (i & 1) {
+      secret[i / 2] = b;
+      b = 0;
+    }
+  }
+  return 0;
 }
 
 int tcp_rpcs_set_ext_secret_max_conn (unsigned char secret[16], int max_conn) {
@@ -201,6 +228,127 @@ void tcp_rpcs_release_ext_secret (int secret_id) {
     return;
   }
   __sync_fetch_and_add (&ext_secret_conn_count[secret_id], -1);
+}
+
+/* Re-read the secret file and swap the table over, without disturbing the
+   connections already running through it.
+
+   Order matters. Secrets that survive the reload are updated in place and
+   never pass through an inactive state, because a client handshaking during
+   that window would be turned away for no reason. Only then are the secrets
+   missing from the file retired, and only a retired slot whose connections
+   have all drained is ever handed to a different secret.
+
+   Returns the number of secrets now active, or -1 if the file could not be
+   read - in which case the running table is left exactly as it was. A proxy
+   serving traffic on the old secrets is a far better outcome than one that
+   dropped them because a file was briefly unreadable. */
+int tcp_rpcs_load_ext_secret_file (const char *path) {
+  FILE *f = fopen (path, "r");
+  if (!f) {
+    return -1;
+  }
+
+  unsigned char parsed[16][16];
+  int parsed_max[16];
+  int parsed_cnt = 0;
+  char line[256];
+
+  while (parsed_cnt < 16 && fgets (line, sizeof (line), f)) {
+    char *p = line;
+    while (*p == ' ' || *p == '\t') {
+      p++;
+    }
+    if (*p == '#' || *p == '\n' || *p == '\r' || !*p) {
+      continue;
+    }
+    if (strlen (p) < 32 || tcp_rpcs_parse_hex_secret (p, parsed[parsed_cnt]) < 0) {
+      fclose (f);
+      return -1;
+    }
+    p += 32;
+    long max_conn = 0;
+    while (*p == ' ' || *p == '\t') {
+      p++;
+    }
+    if (*p && *p != '-' && *p != '\n' && *p != '\r') {
+      max_conn = strtol (p, NULL, 10);
+      if (max_conn < 0) {
+        max_conn = 0;
+      }
+    }
+    parsed_max[parsed_cnt] = (int) max_conn;
+    parsed_cnt++;
+  }
+  fclose (f);
+
+  if (!parsed_cnt) {
+    return -1;
+  }
+
+  int keep[16];
+  int matched[16];
+  int i, j;
+  for (i = 0; i < 16; i++) {
+    keep[i] = 0;
+  }
+  for (j = 0; j < parsed_cnt; j++) {
+    matched[j] = 0;
+  }
+
+  /* Survivors first, updated where they already sit. */
+  for (j = 0; j < parsed_cnt; j++) {
+    for (i = 0; i < ext_secret_cnt; i++) {
+      if (!keep[i] && !memcmp (ext_secret[i], parsed[j], 16)) {
+        ext_secret_max_conn[i] = parsed_max[j];
+        ext_secret_active[i] = 1;
+        keep[i] = 1;
+        matched[j] = 1;
+        break;
+      }
+    }
+  }
+
+  /* Then newcomers, into a free slot or a drained one. */
+  for (j = 0; j < parsed_cnt; j++) {
+    if (matched[j]) {
+      continue;
+    }
+    int slot = -1;
+    for (i = 0; i < ext_secret_cnt; i++) {
+      if (!keep[i] && !ext_secret_active[i] && !ext_secret_conn_count[i]) {
+        slot = i;
+        break;
+      }
+    }
+    if (slot < 0 && ext_secret_cnt < 16) {
+      slot = ext_secret_cnt++;
+    }
+    if (slot < 0) {
+      /* Every slot is either in the new file or still draining. The secret is
+         skipped rather than forced in; the next reload will place it. */
+      continue;
+    }
+    ext_secret_active[slot] = 0;
+    __sync_synchronize ();
+    memcpy (ext_secret[slot], parsed[j], 16);
+    ext_secret_max_conn[slot] = parsed_max[j];
+    ext_secret_conn_count[slot] = 0;
+    __sync_synchronize ();
+    ext_secret_active[slot] = 1;
+    keep[slot] = 1;
+  }
+
+  /* Finally retire what the file no longer lists. */
+  int active = 0;
+  for (i = 0; i < ext_secret_cnt; i++) {
+    if (!keep[i]) {
+      ext_secret_active[i] = 0;
+    } else {
+      active++;
+    }
+  }
+  return active;
 }
 
 int tcp_rpcs_ext_secret_conn_count (int secret_id) {
@@ -1207,6 +1355,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         unsigned char expected_random[32];
         int secret_id;
         for (secret_id = 0; secret_id < ext_secret_cnt; secret_id++) {
+          if (!ext_secret_active[secret_id]) {
+            continue;
+          }
           sha256_hmac (ext_secret[secret_id], 16, client_hello, len, expected_random);
           if (memcmp (expected_random, client_random, 28) == 0) {
             break;
@@ -1345,6 +1496,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       int ok = 0;
       int secret_id;
       for (secret_id = 0; secret_id < 1 || secret_id < ext_secret_cnt; secret_id++) {
+        if (ext_secret_cnt > 0 && !ext_secret_active[secret_id]) {
+          continue;
+        }
         if (ext_secret_cnt > 0) {
           memcpy (k, random_header + 8, 32);
           memcpy (k + 32, ext_secret[secret_id], 16);

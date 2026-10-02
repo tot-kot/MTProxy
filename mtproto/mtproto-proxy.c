@@ -2082,6 +2082,7 @@ int http_ports_num;
 int http_sfd[MAX_HTTP_LISTEN_PORTS], http_port[MAX_HTTP_LISTEN_PORTS];
 static int domain_count;
 static int secret_count;
+static const char *secret_file;
 
 // static double next_create_outbound;
 // int outbound_connections_per_second = DEFAULT_OUTBOUND_CONNECTION_CREATION_RATE;
@@ -2116,6 +2117,24 @@ void precise_cron (void) {
   update_local_stats ();
 }
 
+/* Limits and secrets change whenever a subscription is sold, renewed or
+   revoked. Restarting for that costs every client on the container their
+   connection, which is tolerable while a container serves one customer and
+   plainly not once it serves fifteen. */
+void mtfront_sighup_handler (void) {
+  if (secret_file) {
+    int active = tcp_rpcs_load_ext_secret_file (secret_file);
+    if (active < 0) {
+      kprintf ("SIGHUP: cannot re-read secrets from '%s', keeping the running table\n", secret_file);
+    } else {
+      kprintf ("SIGHUP: reloaded secrets from '%s', %d active\n", secret_file, active);
+    }
+  }
+  if (workers) {
+    kill_children (SIGHUP);
+  }
+}
+
 void mtfront_sigusr1_handler (void) {
   reopen_logs_ext (slave_mode);
   if (workers) {
@@ -2138,29 +2157,6 @@ void usage (void) {
 }
 
 server_functions_t mtproto_front_functions;
-/* 32 hex digits into 16 bytes. Shared by -S, -P and --secret-limit so that
-   all three agree on what a secret looks like. */
-static int parse_hex_secret (const char *text, unsigned char secret[16]) {
-  int i;
-  unsigned char b = 0;
-  for (i = 0; i < 32; i++) {
-    if (text[i] >= '0' && text[i] <= '9') {
-      b = b * 16 + text[i] - '0';
-    } else if (text[i] >= 'a' && text[i] <= 'f') {
-      b = b * 16 + text[i] - 'a' + 10;
-    } else if (text[i] >= 'A' && text[i] <= 'F') {
-      b = b * 16 + text[i] - 'A' + 10;
-    } else {
-      return -1;
-    }
-    if (i & 1) {
-      secret[i / 2] = b;
-      b = 0;
-    }
-  }
-  return 0;
-}
-
 int f_parse_option (int val) {
   char *colon, *ptr;
   switch (val) {
@@ -2220,6 +2216,14 @@ int f_parse_option (int val) {
     tcp_rpc_add_proxy_domain (optarg);
     domain_count++;
     break;
+  case 2002:
+    secret_file = optarg;
+    if (tcp_rpcs_load_ext_secret_file (secret_file) < 0) {
+      kprintf ("cannot read secrets from '%s'\n", secret_file);
+      usage ();
+    }
+    secret_count++;
+    break;
   case 2001:
     {
       /* A customer's tariff is a property of their secret, not of the process
@@ -2231,7 +2235,7 @@ int f_parse_option (int val) {
         usage ();
       }
       unsigned char secret[16];
-      if (parse_hex_secret (optarg, secret) < 0) {
+      if (tcp_rpcs_parse_hex_secret (optarg, secret) < 0) {
         kprintf ("'secret-limit' option requires 32 hex digits before the colon\n");
         usage ();
       }
@@ -2256,7 +2260,7 @@ int f_parse_option (int val) {
       }
 
       unsigned char secret[16];
-      if (parse_hex_secret (optarg, secret) < 0) {
+      if (tcp_rpcs_parse_hex_secret (optarg, secret) < 0) {
         kprintf ("'%c' option requires exactly 32 hex digits\n", val);
         usage ();
       }
@@ -2281,6 +2285,7 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("proxy-tag", required_argument, 0, 'P', "16-byte proxy tag in hex mode to be passed along with all forwarded queries");
   parse_option ("domain", required_argument, 0, 'D', "adds allowed domain for TLS-transport mode, disables other transports; can be specified more than once");
   parse_option ("max-special-connections", required_argument, 0, 'C', "sets maximal number of accepted client connections per worker");
+  parse_option ("secret-file", required_argument, 0, 2002, "reads secrets and their limits from a file, one '<secret-hex> <max-connections|-> <kbit|->' per line; re-read on SIGHUP so limits change without dropping connections");
   parse_option ("secret-limit", required_argument, 0, 2001, "<secret-hex>:<max-connections> limits one secret's concurrent client connections; repeatable, and the secret must already be given with -S");
   parse_option ("window-clamp", required_argument, 0, 'W', "sets window clamp for client TCP connections");
   parse_option ("http-ports", required_argument, 0, 'H', "comma-separated list of client (HTTP) ports to listen");
@@ -2411,5 +2416,6 @@ int main (int argc, char *argv[]) {
   mtproto_front_functions.allowed_signals |= SIG2INT (SIGCHLD);
   mtproto_front_functions.signal_handlers[SIGCHLD] = on_child_termination;
   mtproto_front_functions.signal_handlers[SIGUSR1] = mtfront_sigusr1_handler;
+  mtproto_front_functions.signal_handlers[SIGHUP] = mtfront_sighup_handler;
   return default_main (&mtproto_front_functions, argc, argv);
 }
