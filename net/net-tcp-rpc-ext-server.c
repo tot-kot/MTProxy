@@ -200,7 +200,16 @@ void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
    SO_MARK, which would. */
 #define SHAPED_PRIORITY 1
 
-#define CONNECTIONS_PER_DEVICE 16
+/* A device opens several connections at once, and rather more than one might
+   guess: a single idle Telegram client was measured holding eleven to twenty,
+   across its home and media data centres. Sixteen starved it - the client sat
+   pinned one below the cap and stopped loading content while still reporting
+   itself connected.
+
+   Connections are not sold, so this only has to be generous enough never to
+   trip a real client while still stopping one customer from eating a shared
+   container's buffer pool. Three times the observed peak. */
+#define CONNECTIONS_PER_DEVICE 64
 #define DEVICE_SLOTS_PER_SECRET 128
 #define DEVICE_TTL 28800.0
 
@@ -392,6 +401,16 @@ static void apply_secret_limits (int slot, int devices, int shaped) {
   ext_secret_max_devices[slot] = devices;
   ext_secret_max_conn[slot] = devices > 0 ? devices * CONNECTIONS_PER_DEVICE : 0;
   ext_secret_shaped[slot] = shaped;
+}
+
+/* Whether this secret is sold by device at all. The free secret is not: one
+   secret, thousands of people, so tracking devices for it would thrash a
+   128-slot table on every new key and buy nothing. */
+int tcp_rpcs_ext_secret_limits_devices (int secret_id) {
+  if (secret_id < 0 || secret_id >= 16) {
+    return 0;
+  }
+  return ext_secret_max_devices[secret_id] > 0;
 }
 
 int tcp_rpcs_ext_secret_priority (int secret_id) {
@@ -1552,7 +1571,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
            on a connection that is about to be refused. Refusal looks like any
            other failed handshake. */
         if (!tcp_rpcs_acquire_ext_secret (secret_id)) {
-          vkprintf (1, "connection limit reached for secret %d\n", secret_id);
+          kprintf ("connection limit reached for secret %d\n", secret_id);
           RETURN_TLS_ERROR(info);
         }
         D->ext_secret_slot = secret_id + 1;
@@ -1737,7 +1756,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           if (!tcp_rpcs_acquire_ext_secret (secret_id)) {
             /* Over this secret's connection limit. Answered exactly like a
                wrong secret, so a client cannot tell the two apart by probing. */
-            vkprintf (1, "connection limit reached for secret %d\n", secret_id);
+            kprintf ("connection limit reached for secret %d\n", secret_id);
             return (-1 << 28);
           }
           D->ext_secret_slot = secret_id + 1;

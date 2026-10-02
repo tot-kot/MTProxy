@@ -1087,6 +1087,18 @@ int mtproto_ext_rpc_ready (connection_job_t C) {
 int mtproto_ext_rpc_close (connection_job_t C, int who) {
   assert ((unsigned) CONN_INFO(C)->fd < MAX_CONNECTIONS);
   vkprintf (3, "ext_rpc connection closing (%d) by %d\n", CONN_INFO(C)->fd, who);
+  /* This is the close hook that actually runs for client connections -
+     ct_tcp_rpc_ext_server dispatches through ext_rpc_methods. Releasing the
+     secret's connection slot anywhere else leaks it: the count only ever rose,
+     and once it reached the limit every new connection was refused while the
+     ones already open kept working. The device slot is deliberately not
+     released - it is sticky for its TTL, which is what stops a tariff being
+     multiplied by reconnecting. */
+  struct tcp_rpc_data *D = TCP_RPC_DATA(C);
+  if (D->ext_secret_slot) {
+    tcp_rpcs_release_ext_secret (D->ext_secret_slot - 1);
+    D->ext_secret_slot = 0;
+  }
   struct ext_connection *Ex = get_ext_connection_by_in_fd (CONN_INFO(C)->fd);
   if (Ex) {
     remove_ext_connection (Ex, 1);
@@ -1687,22 +1699,34 @@ static int forward_mtproto_enc_packet (struct tl_in_state *tlio_in, connection_j
      device is. The scan happens once per connection; afterwards the slot index
      is cached on the connection and only a timestamp is refreshed. */
   struct tcp_rpc_data *D = TCP_RPC_DATA(C);
-  if (D->ext_secret_slot) {
+  /* Not precise_now: it is thread local and only refreshed by whoever last
+     called the clock on this thread, which is why the line below reads the
+     clock explicitly. Feeding a stale value into the TTL makes entries look
+     either ancient or brand new, so one reading is taken here and used for
+     both. */
+  double now = get_utime_monotonic ();
+  if (D->ext_secret_slot && tcp_rpcs_ext_secret_limits_devices (D->ext_secret_slot - 1)) {
     int secret_id = D->ext_secret_slot - 1;
     int cached = D->ext_device_slot - 1;
     if (D->ext_auth_key_id != auth_key_id || cached < 0 ||
-        !tcp_rpcs_touch_device (secret_id, cached, auth_key_id, precise_now)) {
-      int slot = tcp_rpcs_claim_device (secret_id, TCP_RPC_DATA(C)->extra_int4, auth_key_id, precise_now);
+        !tcp_rpcs_touch_device (secret_id, cached, auth_key_id, now)) {
+      int slot = tcp_rpcs_claim_device (secret_id, D->extra_int4, auth_key_id, now);
       if (slot < 0) {
-        vkprintf (1, "device limit reached for secret %d, key=%016llx\n", secret_id, auth_key_id);
+        /* Logged unconditionally: a customer being turned away at their device
+           limit is something an operator needs to see without first raising
+           the verbosity of a running proxy. */
+        kprintf ("device limit reached: secret=%d dc=%d key=%016llx\n",
+                 secret_id, D->extra_int4, auth_key_id);
         return 0;
       }
+      vkprintf (1, "device claimed: secret=%d dc=%d key=%016llx slot=%d\n",
+                secret_id, D->extra_int4, auth_key_id, slot);
       D->ext_device_slot = slot + 1;
       D->ext_auth_key_id = auth_key_id;
     }
   }
 
-  CONN_INFO(C)->query_start_time = get_utime_monotonic ();
+  CONN_INFO(C)->query_start_time = now;
 
   conn_target_job_t S = choose_proxy_target (TCP_RPC_DATA(C)->extra_int4);
 
