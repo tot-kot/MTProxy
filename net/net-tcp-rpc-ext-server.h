@@ -52,6 +52,10 @@ int tcp_rpcs_claim_device(int secret_id, int dc, long long auth_key_id, double n
 /* 1 when the slot still belongs to this device and was refreshed. */
 int tcp_rpcs_touch_device(int secret_id, int slot, long long auth_key_id, double now);
 
+/* Socket priority to tag this secret's client connections with, so that tc on
+   the host can put them in a rate limited band. 0 means unshaped. */
+int tcp_rpcs_ext_secret_priority(int secret_id);
+
 void tcp_rpc_add_proxy_domain (const char *domain);
 
 void tcp_rpc_init_proxy_domains();

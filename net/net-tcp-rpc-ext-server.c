@@ -195,6 +195,11 @@ void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
    a connection, which is why this prevents rather than recovers. */
 #define BUFFER_PRESSURE_WATERMARK 85
 
+/* Socket priority for rate limited secrets. Priorities up to 6 are settable
+   without CAP_NET_ADMIN, so the container needs no extra privilege - unlike
+   SO_MARK, which would. */
+#define SHAPED_PRIORITY 1
+
 #define CONNECTIONS_PER_DEVICE 16
 #define DEVICE_SLOTS_PER_SECRET 128
 #define DEVICE_TTL 28800.0
@@ -207,6 +212,13 @@ struct device_slot {
 
 static struct device_slot ext_secret_devices[16][DEVICE_SLOTS_PER_SECRET];
 static int ext_secret_max_devices[16];
+/* Whether this secret's traffic is rate limited. The shaping itself is done by
+   the kernel: the client socket is tagged with a priority and tc on the host
+   puts that priority in a band whose leaf qdisc carries the rate. Userspace
+   never queues a byte, which is what made a token bucket in here a dead end -
+   the only buffer available to hold back a download is the one whose
+   exhaustion used to abort the process. */
+static int ext_secret_shaped[16];
 static int ext_secret_device_lock[16];
 
 static void lock_device_table (int secret_id) {
@@ -293,6 +305,19 @@ int tcp_rpcs_touch_device (int secret_id, int slot, long long auth_key_id, doubl
   return 1;
 }
 
+/* Tag the client socket so the host's tc can shape it. Applied once, at the
+   handshake, because that is where the secret becomes known and because the
+   kernel carries the priority on every packet the socket sends afterwards. */
+static void apply_socket_priority (struct connection_info *c, int secret_id) {
+  int prio = tcp_rpcs_ext_secret_priority (secret_id);
+  if (!prio || c->fd < 0) {
+    return;
+  }
+  if (setsockopt (c->fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof (prio)) < 0) {
+    vkprintf (1, "cannot set SO_PRIORITY %d on fd %d: %m\n", prio, c->fd);
+  }
+}
+
 int tcp_rpcs_parse_hex_secret (const char *text, unsigned char secret[16]) {
   int i;
   unsigned char b = 0;
@@ -363,9 +388,17 @@ void tcp_rpcs_release_ext_secret (int secret_id) {
    dropped them because a file was briefly unreadable. */
 /* The file sells devices; connections follow from them and are only a guard
    against one client monopolising the container's buffer pool. */
-static void apply_secret_limits (int slot, int devices) {
+static void apply_secret_limits (int slot, int devices, int shaped) {
   ext_secret_max_devices[slot] = devices;
   ext_secret_max_conn[slot] = devices > 0 ? devices * CONNECTIONS_PER_DEVICE : 0;
+  ext_secret_shaped[slot] = shaped;
+}
+
+int tcp_rpcs_ext_secret_priority (int secret_id) {
+  if (secret_id < 0 || secret_id >= 16) {
+    return 0;
+  }
+  return ext_secret_shaped[secret_id] ? SHAPED_PRIORITY : 0;
 }
 
 int tcp_rpcs_load_ext_secret_file (const char *path) {
@@ -376,6 +409,7 @@ int tcp_rpcs_load_ext_secret_file (const char *path) {
 
   unsigned char parsed[16][16];
   int parsed_devices[16];
+  int parsed_shaped[16];
   int parsed_cnt = 0;
   char line[256];
 
@@ -403,6 +437,16 @@ int tcp_rpcs_load_ext_secret_file (const char *path) {
       }
     }
     parsed_devices[parsed_cnt] = (int) max_conn;
+
+    /* Third column is the rate in kbit. Only its presence matters here: the
+       number itself is applied by tc on the host, which owns the band. */
+    while (*p && *p != ' ' && *p != '\t') {
+      p++;
+    }
+    while (*p == ' ' || *p == '\t') {
+      p++;
+    }
+    parsed_shaped[parsed_cnt] = (*p && *p != '-' && *p != '\n' && *p != '\r') ? 1 : 0;
     parsed_cnt++;
   }
   fclose (f);
@@ -425,7 +469,7 @@ int tcp_rpcs_load_ext_secret_file (const char *path) {
   for (j = 0; j < parsed_cnt; j++) {
     for (i = 0; i < ext_secret_cnt; i++) {
       if (!keep[i] && !memcmp (ext_secret[i], parsed[j], 16)) {
-        apply_secret_limits (i, parsed_devices[j]);
+        apply_secret_limits (i, parsed_devices[j], parsed_shaped[j]);
         ext_secret_active[i] = 1;
         keep[i] = 1;
         matched[j] = 1;
@@ -457,7 +501,7 @@ int tcp_rpcs_load_ext_secret_file (const char *path) {
     ext_secret_active[slot] = 0;
     __sync_synchronize ();
     memcpy (ext_secret[slot], parsed[j], 16);
-    apply_secret_limits (slot, parsed_devices[j]);
+    apply_secret_limits (slot, parsed_devices[j], parsed_shaped[j]);
     ext_secret_conn_count[slot] = 0;
     memset (ext_secret_devices[slot], 0, sizeof (ext_secret_devices[slot]));
     __sync_synchronize ();
@@ -1512,6 +1556,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           RETURN_TLS_ERROR(info);
         }
         D->ext_secret_slot = secret_id + 1;
+        apply_socket_priority (c, secret_id);
 
         int pos = 76;
         int cipher_suites_length = read_length (client_hello, &pos);
@@ -1696,6 +1741,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
             return (-1 << 28);
           }
           D->ext_secret_slot = secret_id + 1;
+          apply_socket_priority (c, secret_id);
           ok = 1;
           break;
         } else {
