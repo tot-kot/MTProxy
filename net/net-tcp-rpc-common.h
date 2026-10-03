@@ -147,6 +147,9 @@ struct tcp_rpc_data {
      only refreshes a timestamp by index. */
   int ext_device_slot;
   long long ext_auth_key_id;
+  /* Set once this connection's handshake outcome has been counted, so that a
+     connection already refused is not counted again when it times out. */
+  int ext_hs_counted;
   double extra_double, extra_double2;
   crc32_partial_func_t custom_crc_partial;
 };

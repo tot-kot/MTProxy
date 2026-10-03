@@ -403,6 +403,8 @@ struct worker_stats {
 
   long long ext_connections, ext_connections_created;
   long long http_queries, http_bad_headers;
+
+  struct ext_secret_stats ext;
 };
 
 struct worker_stats *WStats, SumStats;
@@ -430,6 +432,7 @@ static void update_local_stats_copy (struct worker_stats *S) {
   fetch_tot_dh_rounds_stat (S->tot_dh_rounds);
   fetch_connections_stat (&S->conn);
   fetch_aes_crypto_stat (&S->allocated_aes_crypto, &S->allocated_aes_crypto_temp);
+  tcp_rpcs_fetch_ext_stats (&S->ext);
   fetch_buffers_stat (&S->bufs);
 
   UPD (ev_heap_size); 
@@ -459,6 +462,23 @@ static void update_local_stats_copy (struct worker_stats *S) {
   __sync_synchronize();
   S->cnt++;
   __sync_synchronize();
+}
+
+static void add_ext_stats (struct ext_secret_stats *to, const struct ext_secret_stats *from) {
+  int i;
+  for (i = 0; i < EXT_HS_OUTCOMES; i++) {
+    to->handshakes[i] += from->handshakes[i];
+  }
+  for (i = 0; i < EXT_SECRETS_MAX; i++) {
+    to->secret_handshakes_ok[i] += from->secret_handshakes_ok[i];
+    to->secret_connection_limit[i] += from->secret_connection_limit[i];
+    to->secret_device_refusals[i] += from->secret_device_refusals[i];
+    to->secret_connections[i] += from->secret_connections[i];
+    /* Workers each see a share of the connections, and a device's
+       connections can land on different workers; summing overcounts it.
+       Exact only with one worker, which is how the containers run. */
+    to->secret_clients[i] += from->secret_clients[i];
+  }
 }
 
 static inline void add_stats (struct worker_stats *W) {
@@ -529,6 +549,7 @@ static inline void add_stats (struct worker_stats *W) {
   UPD (http_queries); 
   UPD (http_bad_headers);
 #undef UPD
+  add_ext_stats (&SumStats.ext, &W->ext);
 }
 
 void update_local_stats (void) {
@@ -573,6 +594,105 @@ void compute_stats_sum (void) {
  *
  */
 
+
+static const char *const handshake_outcome_names[EXT_HS_OUTCOMES] = {
+  [EXT_HS_OK] = "ok",
+  [EXT_HS_UNKNOWN_SECRET] = "unknown_secret",
+  [EXT_HS_BAD_TLS] = "bad_tls",
+  [EXT_HS_POOL_PRESSURE] = "pool_pressure",
+  [EXT_HS_CONNECTION_LIMIT] = "connection_limit",
+  [EXT_HS_TIMEOUT] = "timeout",
+};
+
+/* Prometheus text format. Values come from the workers' published copies
+   when there are workers - whichever process answers, each worker counted
+   once - and from this process otherwise. */
+void mtfront_prepare_metrics (stats_buffer_t *sb) {
+  struct ext_secret_stats st;
+  struct connections_stat conn;
+  struct buffers_stat bufs;
+  compute_stats_sum ();
+  if (workers) {
+    st = SumStats.ext;
+    conn = SumStats.conn;
+    bufs = SumStats.bufs;
+  } else {
+    tcp_rpcs_fetch_ext_stats (&st);
+    fetch_connections_stat (&conn);
+    fetch_buffers_stat (&bufs);
+  }
+
+  /* No sb_prepare: it writes the engine's own tab-separated dump, which is
+     /stats material and not valid Prometheus text. */
+  int i;
+
+  sb_printf (sb, "# HELP mtproxy_handshakes_total Client handshakes by outcome. Refused ones are otherwise silent.\n"
+                 "# TYPE mtproxy_handshakes_total counter\n");
+  for (i = 0; i < EXT_HS_OUTCOMES; i++) {
+    sb_printf (sb, "mtproxy_handshakes_total{outcome=\"%s\"} %lld\n", handshake_outcome_names[i], st.handshakes[i]);
+  }
+
+  int handshaked = 0;
+  int n = tcp_rpcs_ext_secret_count ();
+  sb_printf (sb, "# HELP mtproxy_secret_handshakes_total Handshakes per secret: accepted, or refused at its connection limit.\n"
+                 "# TYPE mtproxy_secret_handshakes_total counter\n");
+  for (i = 0; i < n; i++) {
+    const char *id = tcp_rpcs_ext_secret_id (i);
+    if (!*id) {
+      continue;
+    }
+    sb_printf (sb, "mtproxy_secret_handshakes_total{secret=\"%s\",outcome=\"ok\"} %lld\n", id, st.secret_handshakes_ok[i]);
+    sb_printf (sb, "mtproxy_secret_handshakes_total{secret=\"%s\",outcome=\"connection_limit\"} %lld\n", id, st.secret_connection_limit[i]);
+  }
+  sb_printf (sb, "# HELP mtproxy_device_refusals_total Packets dropped because a new device would exceed the secret's limit.\n"
+                 "# TYPE mtproxy_device_refusals_total counter\n");
+  for (i = 0; i < n; i++) {
+    const char *id = tcp_rpcs_ext_secret_id (i);
+    if (*id) {
+      sb_printf (sb, "mtproxy_device_refusals_total{secret=\"%s\"} %lld\n", id, st.secret_device_refusals[i]);
+    }
+  }
+  sb_printf (sb, "# HELP mtproxy_client_connections Open client connections past the handshake.\n"
+                 "# TYPE mtproxy_client_connections gauge\n");
+  for (i = 0; i < n; i++) {
+    const char *id = tcp_rpcs_ext_secret_id (i);
+    if (*id) {
+      sb_printf (sb, "mtproxy_client_connections{secret=\"%s\"} %d\n", id, st.secret_connections[i]);
+      handshaked += st.secret_connections[i];
+    }
+  }
+  sb_printf (sb, "# HELP mtproxy_clients Devices on open connections: distinct auth keys in the busiest data centre.\n"
+                 "# TYPE mtproxy_clients gauge\n");
+  for (i = 0; i < n; i++) {
+    const char *id = tcp_rpcs_ext_secret_id (i);
+    if (*id) {
+      sb_printf (sb, "mtproxy_clients{secret=\"%s\"} %d\n", id, st.secret_clients[i]);
+    }
+  }
+  sb_printf (sb, "# HELP mtproxy_secret_device_limit Devices the secret is sold for; 0 means unlimited.\n"
+                 "# TYPE mtproxy_secret_device_limit gauge\n");
+  for (i = 0; i < n; i++) {
+    const char *id = tcp_rpcs_ext_secret_id (i);
+    if (*id) {
+      sb_printf (sb, "mtproxy_secret_device_limit{secret=\"%s\"} %d\n", id, tcp_rpcs_ext_secret_max_devices (i));
+    }
+  }
+
+  int pending = conn.allocated_inbound_connections - handshaked;
+  sb_printf (sb, "# HELP mtproxy_pending_connections Inbound connections not past a handshake: still within the timeout, or refused and waiting it out.\n"
+                 "# TYPE mtproxy_pending_connections gauge\n"
+                 "mtproxy_pending_connections %d\n", pending > 0 ? pending : 0);
+  sb_printf (sb, "# HELP mtproxy_buffer_pool_allocated_bytes Message buffer pool taken so far. Never returned, so a high-water mark.\n"
+                 "# TYPE mtproxy_buffer_pool_allocated_bytes gauge\n"
+                 "mtproxy_buffer_pool_allocated_bytes %lld\n"
+                 "# HELP mtproxy_buffer_pool_limit_bytes Pool ceiling; new handshakes are refused from 85%% of it.\n"
+                 "# TYPE mtproxy_buffer_pool_limit_bytes gauge\n"
+                 "mtproxy_buffer_pool_limit_bytes %lld\n",
+             bufs.allocated_buffer_bytes, bufs.max_allocated_buffer_bytes);
+  sb_printf (sb, "# HELP mtproxy_uptime_seconds Seconds since the proxy started.\n"
+                 "# TYPE mtproxy_uptime_seconds gauge\n"
+                 "mtproxy_uptime_seconds %d\n", now - start_time);
+}
 
 void mtfront_prepare_stats (stats_buffer_t *sb) {
   struct connections_stat conn;
@@ -1099,6 +1219,7 @@ int mtproto_ext_rpc_close (connection_job_t C, int who) {
     tcp_rpcs_release_ext_secret (D->ext_secret_slot - 1);
     D->ext_secret_slot = 0;
   }
+  tcp_rpcs_ext_conn_closed (C);
   struct ext_connection *Ex = get_ext_connection_by_in_fd (CONN_INFO(C)->fd);
   if (Ex) {
     remove_ext_connection (Ex, 1);
@@ -1408,28 +1529,37 @@ int hts_stats_execute (connection_job_t c, struct raw_message *msg, int op) {
     D->query_flags &= ~QF_KEEPALIVE;
     return -501;
   }
+  /* Loopback only, for /metrics as for /stats. The engine binds this port to
+     127.0.0.1 anyway; a scraper on the host reads it from inside the
+     container's network namespace. */
   if (CONN_INFO(c)->remote_ip != 0x7f000001) {
     return -404;
   }
 
-  if (D->uri_size != 6) {
+  if (D->uri_size != 6 && D->uri_size != 8) {
     return -404;
   }
   
   char ReqHdr[MAX_HTTP_HEADER_SIZE];
   assert (rwm_fetch_data (msg, &ReqHdr, D->header_size) == D->header_size);
   
-  if (memcmp (ReqHdr + D->uri_offset, "/stats", 6)) {
+  int metrics = D->uri_size == 8 && !memcmp (ReqHdr + D->uri_offset, "/metrics", 8);
+  int stats = D->uri_size == 6 && !memcmp (ReqHdr + D->uri_offset, "/stats", 6);
+  if (!metrics && !stats) {
     return -404;
   }
 
   stats_buffer_t sb;
   sb_alloc(&sb, 1 << 20);
-  mtfront_prepare_stats(&sb);
+  if (metrics) {
+    mtfront_prepare_metrics (&sb);
+  } else {
+    mtfront_prepare_stats(&sb);
+  }
 
   struct raw_message *raw = calloc (sizeof (*raw), 1);
   rwm_init (raw, 0);
-  write_basic_http_header_raw (c, raw, 200, 0, sb.pos, 0, "text/plain");
+  write_basic_http_header_raw (c, raw, 200, 0, sb.pos, 0, metrics ? "text/plain; version=0.0.4" : "text/plain");
   assert (rwm_push_data (raw, sb.buff, sb.pos) == sb.pos);
   mpq_push_w (CONN_INFO(c)->out_queue, raw, 0);
   job_signal (JOB_REF_CREATE_PASS (c), JS_RUN);
@@ -1717,6 +1847,7 @@ static int forward_mtproto_enc_packet (struct tl_in_state *tlio_in, connection_j
            the verbosity of a running proxy. */
         kprintf ("device limit reached: secret=%d dc=%d key=%016llx\n",
                  secret_id, D->extra_int4, auth_key_id);
+        tcp_rpcs_count_device_refusal (secret_id);
         return 0;
       }
       vkprintf (1, "device claimed: secret=%d dc=%d key=%016llx slot=%d\n",
@@ -1725,6 +1856,10 @@ static int forward_mtproto_enc_packet (struct tl_in_state *tlio_in, connection_j
       D->ext_auth_key_id = auth_key_id;
     }
   }
+
+  /* Recorded for every secret, limited or not, so /metrics can count clients
+     on the free proxy too. Writes only when the key changes. */
+  tcp_rpcs_ext_conn_key (C, D->extra_int4, auth_key_id);
 
   CONN_INFO(C)->query_start_time = now;
 
@@ -2157,8 +2292,54 @@ void mtfront_pre_loop (void) {
   }
 }
 
+
+#define CLIENT_COUNT_INTERVAL 5
+#define HANDSHAKE_LOG_INTERVAL 60
+
+/* One line a minute at the default verbosity. Refused handshakes leave no
+   other trace - the connection is kept open and read into the void - and a
+   proxy that had been refusing every new client for eight hours looked, in
+   its log, exactly like a healthy one. */
+static void log_handshake_summary (void) {
+  static long long prev[EXT_HS_OUTCOMES], prev_device_refusals;
+  struct ext_secret_stats st;
+  tcp_rpcs_fetch_ext_stats (&st);
+  long long device_refusals = 0;
+  int connections = 0, clients = 0, i;
+  for (i = 0; i < EXT_SECRETS_MAX; i++) {
+    device_refusals += st.secret_device_refusals[i];
+    connections += st.secret_connections[i];
+    clients += st.secret_clients[i];
+  }
+  char line[512];
+  int pos = snprintf (line, sizeof (line), "handshakes in %ds:", HANDSHAKE_LOG_INTERVAL);
+  for (i = 0; i < EXT_HS_OUTCOMES && pos < (int) sizeof (line); i++) {
+    pos += snprintf (line + pos, sizeof (line) - pos, " %s=%lld", handshake_outcome_names[i], st.handshakes[i] - prev[i]);
+    prev[i] = st.handshakes[i];
+  }
+  kprintf ("%s; device_refusals=%lld; client_connections=%d clients=%d\n",
+           line, device_refusals - prev_device_refusals, connections, clients);
+  prev_device_refusals = device_refusals;
+}
+
 void precise_cron (void) {
   update_local_stats ();
+  /* Only processes that hold client connections: with workers, the master
+     serves none and would only log zeros. */
+  if (workers && !slave_mode) {
+    return;
+  }
+  static int next_client_count, next_log;
+  if (now >= next_client_count) {
+    tcp_rpcs_update_client_counts ();
+    next_client_count = now + CLIENT_COUNT_INTERVAL;
+  }
+  if (!next_log) {
+    next_log = now + HANDSHAKE_LOG_INTERVAL;
+  } else if (now >= next_log) {
+    log_handshake_summary ();
+    next_log = now + HANDSHAKE_LOG_INTERVAL;
+  }
 }
 
 /* Limits and secrets change whenever a subscription is sold, renewed or

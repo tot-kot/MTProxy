@@ -54,6 +54,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -148,6 +149,8 @@ int tcp_proxy_pass_write_packet (connection_job_t C, struct raw_message *raw) {
 int tcp_rpcs_default_execute (connection_job_t c, int op, struct raw_message *msg);
 
 static unsigned char ext_secret[16][16];
+static void refresh_secret_id (int slot);
+static void reset_secret_counters (int slot);
 static int ext_secret_cnt = 0;
 
 /* Per-secret limits and live connection counts.
@@ -171,6 +174,7 @@ static int ext_secret_active[16];
 void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
   assert (ext_secret_cnt < 16);
   memcpy (ext_secret[ext_secret_cnt], secret, 16);
+  refresh_secret_id (ext_secret_cnt);
   ext_secret_active[ext_secret_cnt] = 1;
   ext_secret_cnt ++;
 }
@@ -199,6 +203,10 @@ void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
    without CAP_NET_ADMIN, so the container needs no extra privilege - unlike
    SO_MARK, which would. */
 #define SHAPED_PRIORITY 1
+
+/* Seconds a client has from accept to a usable header. Upstream's own value
+   for handing a silent connection to the fake-TLS domain. */
+#define HANDSHAKE_TIMEOUT 10
 
 /* A device opens several connections at once, and rather more than one might
    guess: a single idle Telegram client was measured holding eleven to twenty,
@@ -520,6 +528,8 @@ int tcp_rpcs_load_ext_secret_file (const char *path) {
     ext_secret_active[slot] = 0;
     __sync_synchronize ();
     memcpy (ext_secret[slot], parsed[j], 16);
+    refresh_secret_id (slot);
+    reset_secret_counters (slot);
     apply_secret_limits (slot, parsed_devices[j], parsed_shaped[j]);
     ext_secret_conn_count[slot] = 0;
     memset (ext_secret_devices[slot], 0, sizeof (ext_secret_devices[slot]));
@@ -545,6 +555,203 @@ int tcp_rpcs_ext_secret_conn_count (int secret_id) {
     return 0;
   }
   return ext_secret_conn_count[secret_id];
+}
+
+/*
+ *  Handshake outcomes, client connections and clients, for /metrics.
+ */
+
+static long long ext_handshakes[EXT_HS_OUTCOMES];
+static long long ext_secret_handshakes_ok[EXT_SECRETS_MAX];
+static long long ext_secret_connection_limit[EXT_SECRETS_MAX];
+static long long ext_secret_device_refusals[EXT_SECRETS_MAX];
+static int ext_secret_clients[EXT_SECRETS_MAX];
+static char ext_secret_id_text[EXT_SECRETS_MAX][9];
+
+static void refresh_secret_id (int slot) {
+  static const char hex[] = "0123456789abcdef";
+  unsigned char digest[32];
+  sha256 (ext_secret[slot], 16, digest);
+  int i;
+  for (i = 0; i < 4; i++) {
+    ext_secret_id_text[slot][2 * i] = hex[digest[i] >> 4];
+    ext_secret_id_text[slot][2 * i + 1] = hex[digest[i] & 15];
+  }
+  ext_secret_id_text[slot][8] = 0;
+}
+
+/* A slot handed to a different secret starts its counters from zero, rather
+   than carrying the previous customer's history under the new one's name. */
+static void reset_secret_counters (int slot) {
+  ext_secret_handshakes_ok[slot] = 0;
+  ext_secret_connection_limit[slot] = 0;
+  ext_secret_device_refusals[slot] = 0;
+  ext_secret_clients[slot] = 0;
+}
+
+const char *tcp_rpcs_ext_secret_id (int secret_id) {
+  if (secret_id < 0 || secret_id >= ext_secret_cnt || !ext_secret_active[secret_id]) {
+    return "";
+  }
+  return ext_secret_id_text[secret_id];
+}
+
+int tcp_rpcs_ext_secret_count (void) {
+  return ext_secret_cnt;
+}
+
+int tcp_rpcs_ext_secret_max_devices (int secret_id) {
+  if (secret_id < 0 || secret_id >= 16) {
+    return 0;
+  }
+  return ext_secret_max_devices[secret_id];
+}
+
+/* One entry per fd. Written by the I/O thread that owns the connection, read
+   by the cron without a lock: a count that is a moment stale is fine, and
+   nothing here is ever dereferenced. The generation guards against an fd that
+   was closed and reused between the write and the read. */
+struct ext_conn_entry {
+  int generation;
+  short secret;  /* secret index + 1; 0 for a free entry */
+  short dc;
+  long long auth_key_id;
+};
+
+static struct ext_conn_entry ext_conns[MAX_CONNECTIONS];
+
+static void register_ext_conn (connection_job_t C, int secret_id) {
+  struct connection_info *c = CONN_INFO (C);
+  if (c->fd < 0 || c->fd >= MAX_CONNECTIONS) {
+    return;
+  }
+  struct ext_conn_entry *e = &ext_conns[c->fd];
+  e->auth_key_id = 0;
+  e->dc = (short) TCP_RPC_DATA (C)->extra_int4;
+  e->generation = c->generation;
+  __sync_synchronize ();
+  e->secret = (short) (secret_id + 1);
+}
+
+void tcp_rpcs_ext_conn_key (connection_job_t C, int dc, long long auth_key_id) {
+  struct connection_info *c = CONN_INFO (C);
+  if (c->fd < 0 || c->fd >= MAX_CONNECTIONS) {
+    return;
+  }
+  struct ext_conn_entry *e = &ext_conns[c->fd];
+  if (e->generation != c->generation || !e->secret ||
+      (e->auth_key_id == auth_key_id && e->dc == dc)) {
+    return;
+  }
+  e->dc = (short) dc;
+  e->auth_key_id = auth_key_id;
+}
+
+void tcp_rpcs_ext_conn_closed (connection_job_t C) {
+  struct connection_info *c = CONN_INFO (C);
+  if (c->fd < 0 || c->fd >= MAX_CONNECTIONS) {
+    return;
+  }
+  struct ext_conn_entry *e = &ext_conns[c->fd];
+  if (e->generation == c->generation) {
+    e->secret = 0;
+  }
+}
+
+void tcp_rpcs_count_handshake (connection_job_t C, enum ext_handshake_outcome outcome, int secret_id) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (D->ext_hs_counted) {
+    return;
+  }
+  D->ext_hs_counted = 1;
+  __sync_fetch_and_add (&ext_handshakes[outcome], 1);
+  if (secret_id < 0 || secret_id >= EXT_SECRETS_MAX) {
+    return;
+  }
+  if (outcome == EXT_HS_OK) {
+    __sync_fetch_and_add (&ext_secret_handshakes_ok[secret_id], 1);
+    register_ext_conn (C, secret_id);
+  } else if (outcome == EXT_HS_CONNECTION_LIMIT) {
+    __sync_fetch_and_add (&ext_secret_connection_limit[secret_id], 1);
+  }
+}
+
+void tcp_rpcs_count_device_refusal (int secret_id) {
+  if (secret_id >= 0 && secret_id < EXT_SECRETS_MAX) {
+    __sync_fetch_and_add (&ext_secret_device_refusals[secret_id], 1);
+  }
+}
+
+struct dc_key {
+  int secret;
+  int dc;
+  long long auth_key_id;
+};
+
+static int cmp_dc_key (const void *a, const void *b) {
+  const struct dc_key *x = a, *y = b;
+  if (x->secret != y->secret) {
+    return x->secret < y->secret ? -1 : 1;
+  }
+  if (x->dc != y->dc) {
+    return x->dc < y->dc ? -1 : 1;
+  }
+  if (x->auth_key_id != y->auth_key_id) {
+    return x->auth_key_id < y->auth_key_id ? -1 : 1;
+  }
+  return 0;
+}
+
+/* Clients are counted the way devices are limited: one device holds one key
+   per data centre, so the number of distinct keys in the busiest data centre
+   is the number of devices. Connections that have not sent an encrypted
+   packet yet carry no key and are not counted. Media data centres are
+   negative ids and count as their own. */
+void tcp_rpcs_update_client_counts (void) {
+  static struct dc_key keys[MAX_CONNECTIONS];
+  int n = 0, fd;
+  for (fd = 0; fd < MAX_CONNECTIONS; fd++) {
+    struct ext_conn_entry *e = &ext_conns[fd];
+    if (!e->secret || !e->auth_key_id) {
+      continue;
+    }
+    keys[n].secret = e->secret - 1;
+    keys[n].dc = e->dc;
+    keys[n].auth_key_id = e->auth_key_id;
+    n++;
+  }
+  qsort (keys, n, sizeof (keys[0]), cmp_dc_key);
+
+  int clients[EXT_SECRETS_MAX];
+  memset (clients, 0, sizeof (clients));
+  int in_dc = 0, i;
+  for (i = 0; i < n; i++) {
+    struct dc_key *k = &keys[i], *prev = i ? &keys[i - 1] : NULL;
+    if (!prev || k->secret != prev->secret || k->dc != prev->dc) {
+      in_dc = 1;
+    } else if (k->auth_key_id != prev->auth_key_id) {
+      in_dc++;
+    }
+    if (k->secret >= 0 && k->secret < EXT_SECRETS_MAX && in_dc > clients[k->secret]) {
+      clients[k->secret] = in_dc;
+    }
+  }
+  memcpy (ext_secret_clients, clients, sizeof (clients));
+}
+
+void tcp_rpcs_fetch_ext_stats (struct ext_secret_stats *out) {
+  memset (out, 0, sizeof (*out));
+  int i;
+  for (i = 0; i < EXT_HS_OUTCOMES; i++) {
+    out->handshakes[i] = ext_handshakes[i];
+  }
+  for (i = 0; i < EXT_SECRETS_MAX; i++) {
+    out->secret_handshakes_ok[i] = ext_secret_handshakes_ok[i];
+    out->secret_connection_limit[i] = ext_secret_connection_limit[i];
+    out->secret_device_refusals[i] = ext_secret_device_refusals[i];
+    out->secret_connections[i] = ext_secret_conn_count[i];
+    out->secret_clients[i] = ext_secret_clients[i];
+  }
 }
 
 static int allow_only_tls;
@@ -1374,22 +1581,62 @@ static int proxy_connection (connection_job_t C, const struct domain_info *info)
   return c->type->parse_execute (C);
 }
 
-int tcp_rpcs_ext_alarm (connection_job_t C) {
+static void release_tls_slot (connection_job_t C) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
-  if (D->in_packet_num == -3 && default_domain_info != NULL) {
-    return proxy_connection (C, default_domain_info);  
-  } else {
-    return 0;
+  if (D->ext_secret_slot) {
+    tcp_rpcs_release_ext_secret (D->ext_secret_slot - 1);
+    D->ext_secret_slot = 0;
   }
 }
 
+/* Fires HANDSHAKE_TIMEOUT seconds after accept unless the header arrived and
+   was accepted, which removes the timer. With a fake-TLS domain configured the
+   connection is handed to that domain, as upstream does. Without one it used
+   to be left open for good: a client whose data never arrived, or one that
+   was refused and put into skip mode, sat in the connection table until TCP
+   keepalive gave up on it two hours later - on the free proxy, eight
+   thousand of them at a time. A Telegram client sends its header the moment
+   it connects, so a real one is never anywhere near this. */
+int tcp_rpcs_ext_alarm (connection_job_t C) {
+  struct tcp_rpc_data *D = TCP_RPC_DATA (C);
+  if (D->in_packet_num != -3) {
+    return 0;
+  }
+  if (default_domain_info != NULL) {
+    return proxy_connection (C, default_domain_info);
+  }
+  tcp_rpcs_count_handshake (C, EXT_HS_TIMEOUT, -1);
+  fail_connection (C, -1);
+  return 0;
+}
+
+/* Upstream accepts with the kernel's keepalive, which gives up on a vanished
+   peer after more than two hours. A client behind a mobile NAT vanishes
+   without a FIN all the time, and each one holds an fd and a slot under -C
+   until then. Two minutes idle, then four probes thirty seconds apart: about
+   four minutes for a dead peer, and the probes double as NAT keep-alives. */
+#define CLIENT_KEEPIDLE 120
+#define CLIENT_KEEPINTVL 30
+#define CLIENT_KEEPCNT 4
+
 int tcp_rpcs_ext_init_accepted (connection_job_t C) {
-  job_timer_insert (C, precise_now + 10);
+  int fd = CONN_INFO (C)->fd;
+  int on = 1, idle = CLIENT_KEEPIDLE, intvl = CLIENT_KEEPINTVL, cnt = CLIENT_KEEPCNT;
+  if (setsockopt (fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof (on)) < 0 ||
+      setsockopt (fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof (idle)) < 0 ||
+      setsockopt (fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof (intvl)) < 0 ||
+      setsockopt (fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof (cnt)) < 0) {
+    vkprintf (1, "cannot set keepalive on fd %d: %m\n", fd);
+  }
+  job_timer_insert (C, precise_now + HANDSHAKE_TIMEOUT);
   return tcp_rpcs_init_accepted_nohs (C);
 }
 
 int tcp_rpcs_compact_parse_execute (connection_job_t C) {
+/* Every refusal is counted; a more specific outcome recorded just before wins,
+   since a connection is only ever counted once. */
 #define RETURN_TLS_ERROR(info) \
+  tcp_rpcs_count_handshake (C, EXT_HS_BAD_TLS, -1); \
   return proxy_connection (C, info);  
 
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
@@ -1554,6 +1801,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         if (secret_id == ext_secret_cnt) {
           vkprintf (1, "Receive request with unmatched client random\n");
+          tcp_rpcs_count_handshake (C, EXT_HS_UNKNOWN_SECRET, -1);
           RETURN_TLS_ERROR(info);
         }
         int timestamp = *(int *)(expected_random + 28) ^ *(int *)(client_random + 28);
@@ -1563,6 +1811,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         if (msg_buffers_full_percent () >= BUFFER_PRESSURE_WATERMARK) {
           vkprintf (1, "buffer pool at %d%%, refusing new client\n", msg_buffers_full_percent ());
+          tcp_rpcs_count_handshake (C, EXT_HS_POOL_PRESSURE, -1);
           RETURN_TLS_ERROR(info);
         }
 
@@ -1572,6 +1821,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
            other failed handshake. */
         if (!tcp_rpcs_acquire_ext_secret (secret_id)) {
           kprintf ("connection limit reached for secret %d\n", secret_id);
+          tcp_rpcs_count_handshake (C, EXT_HS_CONNECTION_LIMIT, secret_id);
           RETURN_TLS_ERROR(info);
         }
         D->ext_secret_slot = secret_id + 1;
@@ -1581,6 +1831,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         int cipher_suites_length = read_length (client_hello, &pos);
         if (pos + cipher_suites_length > read_len) {
           vkprintf (1, "Too long cipher suites list of length %d\n", cipher_suites_length);
+          release_tls_slot (C);
           RETURN_TLS_ERROR(info);
         }
         while (cipher_suites_length >= 2 && (client_hello[pos] & 0x0F) == 0x0A && (client_hello[pos + 1] & 0x0F) == 0x0A) {
@@ -1590,9 +1841,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
         if (cipher_suites_length <= 1 || client_hello[pos] != 0x13 || client_hello[pos + 1] < 0x01 || client_hello[pos + 1] > 0x03) {
           vkprintf (1, "Can't find supported cipher suite\n");
+          release_tls_slot (C);
           RETURN_TLS_ERROR(info);
         }
         unsigned char cipher_suite_id = client_hello[pos + 1];
+        tcp_rpcs_count_handshake (C, EXT_HS_OK, secret_id);
 
         assert (rwm_skip_data (&c->in, len) == len);
         c->flags |= C_IS_TLS;
@@ -1751,16 +2004,19 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           vkprintf (1, "tcp opportunistic encryption mode detected, tag = %08x, target=%d\n", tag, target);
           if (msg_buffers_full_percent () >= BUFFER_PRESSURE_WATERMARK) {
             vkprintf (1, "buffer pool at %d%%, refusing new client\n", msg_buffers_full_percent ());
+            tcp_rpcs_count_handshake (C, EXT_HS_POOL_PRESSURE, -1);
             return (-1 << 28);
           }
           if (!tcp_rpcs_acquire_ext_secret (secret_id)) {
             /* Over this secret's connection limit. Answered exactly like a
                wrong secret, so a client cannot tell the two apart by probing. */
             kprintf ("connection limit reached for secret %d\n", secret_id);
+            tcp_rpcs_count_handshake (C, EXT_HS_CONNECTION_LIMIT, secret_id);
             return (-1 << 28);
           }
           D->ext_secret_slot = secret_id + 1;
           apply_socket_priority (c, secret_id);
+          tcp_rpcs_count_handshake (C, EXT_HS_OK, secret_id);
           ok = 1;
           break;
         } else {
@@ -1775,6 +2031,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
       if (ext_secret_cnt > 0) {
         vkprintf (1, "invalid \"random\" 64-byte header, entering global skip mode\n");
+        tcp_rpcs_count_handshake (C, EXT_HS_UNKNOWN_SECRET, -1);
         return (-1 << 28);
       }
 
@@ -1788,6 +2045,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       continue;
 #else
       vkprintf (1, "invalid \"random\" 64-byte header, entering global skip mode\n");
+      tcp_rpcs_count_handshake (C, EXT_HS_UNKNOWN_SECRET, -1);
       return (-1 << 28);
 #endif
     }

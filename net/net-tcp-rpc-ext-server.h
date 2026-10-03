@@ -59,6 +59,61 @@ int tcp_rpcs_ext_secret_limits_devices(int secret_id);
    the host can put them in a rate limited band. 0 means unshaped. */
 int tcp_rpcs_ext_secret_priority(int secret_id);
 
+/* How each client handshake ended. A rejected handshake is not closed - the
+   connection is left to read and discard, so a prober learns nothing - which
+   also means a refusal is otherwise invisible: the client sits "connected"
+   and nothing is ever logged. These counters are the only record of it. */
+enum ext_handshake_outcome {
+  EXT_HS_OK,
+  /* No configured secret decrypts the header: a stale link, a scanner. */
+  EXT_HS_UNKNOWN_SECRET,
+  /* Fake-TLS handshake that matched a secret but failed later checks. */
+  EXT_HS_BAD_TLS,
+  /* Turned away at the buffer pool watermark. */
+  EXT_HS_POOL_PRESSURE,
+  /* The secret was at its connection limit. */
+  EXT_HS_CONNECTION_LIMIT,
+  /* No usable header within the handshake timeout; the connection is closed. */
+  EXT_HS_TIMEOUT,
+  EXT_HS_OUTCOMES
+};
+
+#define EXT_SECRETS_MAX 16
+
+/* Snapshot of everything the proxy reports per secret. Plain values so that
+   it can be copied into the shared-memory block workers publish their
+   statistics through, and summed there. */
+struct ext_secret_stats {
+  long long handshakes[EXT_HS_OUTCOMES];
+  long long secret_handshakes_ok[EXT_SECRETS_MAX];
+  long long secret_connection_limit[EXT_SECRETS_MAX];
+  long long secret_device_refusals[EXT_SECRETS_MAX];
+  /* Client connections past the handshake, per secret. */
+  int secret_connections[EXT_SECRETS_MAX];
+  /* Distinct devices on currently open connections: distinct auth_key_ids per
+     data centre, the largest of those - the same rule the device limit
+     enforces. A recent value, recomputed every few seconds. */
+  int secret_clients[EXT_SECRETS_MAX];
+};
+
+void tcp_rpcs_count_handshake(connection_job_t c, enum ext_handshake_outcome outcome, int secret_id);
+void tcp_rpcs_count_device_refusal(int secret_id);
+
+/* Registry of client connections past the handshake, by fd: what /metrics
+   needs to count clients without walking the engine's connection table, which
+   holds descriptors of every kind. */
+void tcp_rpcs_ext_conn_key(connection_job_t c, int dc, long long auth_key_id);
+void tcp_rpcs_ext_conn_closed(connection_job_t c);
+/* Recomputes secret_clients from the registry; cheap enough for a cron. */
+void tcp_rpcs_update_client_counts(void);
+void tcp_rpcs_fetch_ext_stats(struct ext_secret_stats *out);
+
+/* Short identifier for a configured secret, safe to show: the first eight hex
+   digits of its SHA-256, never of the secret itself. Empty for a free slot. */
+const char *tcp_rpcs_ext_secret_id(int secret_id);
+int tcp_rpcs_ext_secret_count(void);
+int tcp_rpcs_ext_secret_max_devices(int secret_id);
+
 void tcp_rpc_add_proxy_domain (const char *domain);
 
 void tcp_rpc_init_proxy_domains();
